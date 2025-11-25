@@ -2,7 +2,8 @@ use bollard::Docker;
 use bollard::errors::Error;
 
 use bollard::query_parameters::{
-    CreateContainerOptions, ListContainersOptions, RemoveContainerOptions, StartContainerOptions,
+    CreateContainerOptions, InspectContainerOptions, ListContainersOptions, RemoveContainerOptions,
+    StartContainerOptions, StopContainerOptions,
 };
 
 use bollard::models::{ContainerCreateBody, ContainerSummaryStateEnum, HostConfig};
@@ -93,7 +94,6 @@ async fn reconcile(docker: &Docker, backoff: &mut BackoffState) -> Result<(), Er
         let state = c.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
         let status = c.status.unwrap_or_default().to_lowercase();
 
-        // Hybrid health classification: enum + status string
         let is_running = matches!(state, ContainerSummaryStateEnum::RUNNING)
             || status.contains("up")
             || status.contains("running");
@@ -118,66 +118,77 @@ async fn reconcile(docker: &Docker, backoff: &mut BackoffState) -> Result<(), Er
         backoff.maybe_reset();
     }
 
-    for id in dead {
-        println!("Removing DEAAAD containaa: {id}");
-        docker
-            .remove_container(
-                &id,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    v: false,
-                    link: false,
-                }),
-            )
-            .await?;
+    for id in &dead {
+        println!("Removing dead container: {id}");
+        graceful_remove_container(docker, id).await?;
     }
 
     let running_count = running.len();
+
+    let mut outdated = Vec::new();
+
+    for id in &running {
+        let inspect = docker
+            .inspect_container(id, None::<InspectContainerOptions>)
+            .await?;
+
+        let version = inspect
+            .config
+            .as_ref()
+            .and_then(|cfg| cfg.labels.as_ref())
+            .and_then(|labels| labels.get("version"))
+            .map(|v| v.as_str());
+
+        if version != Some(IMAGE) {
+            outdated.push(id.clone());
+        }
+    }
+
+    if !outdated.is_empty() {
+        println!("Found outdated containers, performing rolling update");
+        return perform_rolling_update(docker, &running).await;
+    }
 
     if running_count < DESIRED_REPLICAS {
         let to_spawn = DESIRED_REPLICAS - running_count;
 
         if backoff.in_backoff() {
             println!(
-                "Backoff active ({} failures). Skipping respawn this cycle.",
+                "Backoff active ({} failures). Skipping respawn this cycle",
                 backoff.consecutive_failures
             );
             return Ok(());
         }
 
         println!("Need {to_spawn} more replicas");
+
         for _ in 0..to_spawn {
-            spawn_replica(docker).await?;
+            spawn_replica_and_get_id(docker).await?;
         }
-    } else if running_count > DESIRED_REPLICAS {
+        return Ok(());
+    }
+
+    if running_count > DESIRED_REPLICAS {
         let to_kill = running_count - DESIRED_REPLICAS;
         println!("Removing {to_kill} extra replicas");
 
         for id in running.iter().take(to_kill) {
-            docker
-                .remove_container(
-                    id,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        v: false,
-                        link: false,
-                    }),
-                )
-                .await?;
+            graceful_remove_container(docker, id).await?;
         }
-    } else {
-        println!("Desired state satisfied");
+        return Ok(());
     }
 
+    println!("Desired state satisfied.");
     Ok(())
 }
 
-async fn spawn_replica(docker: &Docker) -> Result<(), Error> {
+async fn spawn_replica_and_get_id(docker: &Docker) -> Result<String, Error> {
     let container_name = format!("{}-{}", SERVICE_NAME, Uuid::new_v4());
 
     let mut labels = HashMap::new();
     labels.insert("service".to_string(), SERVICE_NAME.to_string());
     labels.insert("managed-by".to_string(), "bollard-orchestrator".to_string());
+    labels.insert("version".to_string(), IMAGE.to_string());
 
     let body = ContainerCreateBody {
         image: Some(IMAGE.to_string()),
@@ -190,10 +201,9 @@ async fn spawn_replica(docker: &Docker) -> Result<(), Error> {
 
     let options = CreateContainerOptions {
         name: Some(container_name.clone()),
-        platform: "".to_string(),
+        platform: "".into(),
     };
 
-    println!("Creating container: {container_name}");
     docker.create_container(Some(options), body).await?;
 
     println!("Starting container: {container_name}");
@@ -201,7 +211,7 @@ async fn spawn_replica(docker: &Docker) -> Result<(), Error> {
         .start_container(&container_name, Some(StartContainerOptions::default()))
         .await?;
 
-    Ok(())
+    Ok(container_name)
 }
 
 async fn connect_with_retry() -> Docker {
@@ -218,4 +228,47 @@ async fn connect_with_retry() -> Docker {
             }
         }
     }
+}
+
+async fn graceful_remove_container(docker: &Docker, id: &str) -> Result<(), Error> {
+    println!("Gracefully stopping container: {id}");
+
+    let stop_options = StopContainerOptions {
+        signal: None,
+        t: Some(5),
+    };
+
+    let _ = docker.stop_container(id, Some(stop_options)).await;
+
+    println!("Removing container: {id}");
+    docker
+        .remove_container(
+            id,
+            Some(RemoveContainerOptions {
+                force: false,
+                v: false,
+                link: false,
+            }),
+        )
+        .await?;
+
+    Ok(())
+}
+
+async fn perform_rolling_update(docker: &Docker, running: &Vec<String>) -> Result<(), Error> {
+    println!("Starting rolling update for image = {}", IMAGE);
+
+    for old_id in running {
+        println!("Spawning new replica before removing: {old_id}");
+        let new_id = spawn_replica_and_get_id(docker).await?;
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        graceful_remove_container(docker, old_id).await?;
+
+        println!("Replaced {old_id} with {new_id}");
+    }
+
+    println!("Rolling update done");
+    Ok(())
 }
