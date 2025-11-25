@@ -8,7 +8,7 @@ use bollard::query_parameters::{
 use bollard::models::{ContainerCreateBody, ContainerSummaryStateEnum, HostConfig};
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -16,14 +16,52 @@ const SERVICE_NAME: &str = "demo-nginx";
 const IMAGE: &str = "nginx:alpine";
 const DESIRED_REPLICAS: usize = 3;
 
+const MAX_CONSECUTIVE_FAILURES: u32 = 5;
+const BACKOFF_DURATION_SECS: u64 = 30;
+const FAILURE_RESET_AFTER_SECS: u64 = 300;
+
+#[derive(Debug, Default)]
+struct BackoffState {
+    consecutive_failures: u32,
+    last_failure: Option<Instant>,
+}
+
+impl BackoffState {
+    fn register_failure(&mut self) {
+        self.consecutive_failures += 1;
+        self.last_failure = Some(Instant::now());
+    }
+
+    fn maybe_reset(&mut self) {
+        if let Some(last) = self.last_failure
+            && last.elapsed() > Duration::from_secs(FAILURE_RESET_AFTER_SECS)
+        {
+            self.consecutive_failures = 0;
+            self.last_failure = None;
+        }
+    }
+
+    fn in_backoff(&self) -> bool {
+        if let Some(last) = self.last_failure
+            && self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+            && last.elapsed() < Duration::from_secs(BACKOFF_DURATION_SECS)
+        {
+            return true;
+        }
+
+        false
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let docker = Docker::connect_with_local_defaults()?;
-    println!("Connected to docker, starting orchestrator");
+    let docker = connect_with_retry().await;
+    let mut backoff = BackoffState::default();
+    println!("Connected to docker, starting orchestrataaa");
     println!("Service: {SERVICE_NAME}, image: {IMAGE}, desired replicas: {DESIRED_REPLICAS}");
 
     loop {
-        if let Err(e) = reconcile(&docker).await {
+        if let Err(e) = reconcile(&docker, &mut backoff).await {
             eprintln!("reconcile error: {:?}", e);
         }
 
@@ -31,7 +69,7 @@ async fn main() -> Result<(), Error> {
     }
 }
 
-async fn reconcile(docker: &Docker) -> Result<(), Error> {
+async fn reconcile(docker: &Docker, backoff: &mut BackoffState) -> Result<(), Error> {
     let mut filters = HashMap::new();
     filters.insert(
         "label".to_string(),
@@ -55,6 +93,7 @@ async fn reconcile(docker: &Docker) -> Result<(), Error> {
         let state = c.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
         let status = c.status.unwrap_or_default().to_lowercase();
 
+        // Hybrid health classification: enum + status string
         let is_running = matches!(state, ContainerSummaryStateEnum::RUNNING)
             || status.contains("up")
             || status.contains("running");
@@ -67,13 +106,20 @@ async fn reconcile(docker: &Docker) -> Result<(), Error> {
     }
 
     println!(
-        "[reconcile] running: {}, dead: {}",
+        "[reconcile] running: {}, dead: {}, backoff: {:?}",
         running.len(),
-        dead.len()
+        dead.len(),
+        backoff
     );
 
+    if !dead.is_empty() {
+        backoff.register_failure();
+    } else {
+        backoff.maybe_reset();
+    }
+
     for id in dead {
-        println!("Removing dead container: {id}");
+        println!("Removing DEAAAD containaa: {id}");
         docker
             .remove_container(
                 &id,
@@ -90,8 +136,16 @@ async fn reconcile(docker: &Docker) -> Result<(), Error> {
 
     if running_count < DESIRED_REPLICAS {
         let to_spawn = DESIRED_REPLICAS - running_count;
-        println!("Need {to_spawn} more replicas");
 
+        if backoff.in_backoff() {
+            println!(
+                "Backoff active ({} failures). Skipping respawn this cycle.",
+                backoff.consecutive_failures
+            );
+            return Ok(());
+        }
+
+        println!("Need {to_spawn} more replicas");
         for _ in 0..to_spawn {
             spawn_replica(docker).await?;
         }
@@ -112,7 +166,7 @@ async fn reconcile(docker: &Docker) -> Result<(), Error> {
                 .await?;
         }
     } else {
-        println!("Desired state satisfied.");
+        println!("Desired state satisfied");
     }
 
     Ok(())
@@ -134,13 +188,13 @@ async fn spawn_replica(docker: &Docker) -> Result<(), Error> {
         ..Default::default()
     };
 
-    let opts = CreateContainerOptions {
+    let options = CreateContainerOptions {
         name: Some(container_name.clone()),
-        platform: "".into(),
+        platform: "".to_string(),
     };
 
     println!("Creating container: {container_name}");
-    docker.create_container(Some(opts), body).await?;
+    docker.create_container(Some(options), body).await?;
 
     println!("Starting container: {container_name}");
     docker
@@ -148,4 +202,20 @@ async fn spawn_replica(docker: &Docker) -> Result<(), Error> {
         .await?;
 
     Ok(())
+}
+
+async fn connect_with_retry() -> Docker {
+    loop {
+        match Docker::connect_with_local_defaults() {
+            Ok(docker) => {
+                println!("Connected to Docker DAEMMONN successfully");
+                return docker;
+            }
+            Err(e) => {
+                eprintln!("Docker not available: {e:?}");
+                eprintln!("Retrying in 3 seconds");
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        }
+    }
 }
